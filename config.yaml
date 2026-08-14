@@ -26,8 +26,8 @@
 # Model
 # ==============================================================================
 model:
-  provider: bedrock
-  model_id: us.anthropic.claude-haiku-4-5-20251001-v1:0
+  provider: ollama
+  model_id: gemma3:4b
   temperature: 0.3
   streaming: true
   # max_tokens: 4096
@@ -40,10 +40,9 @@ model:
   #   guardrail_version: "1"
   #   guardrail_trace: enabled
 
-  # Ollama / llama.cpp endpoints — usually env-specific, prefer the
-  # OLLAMA_URL / LLAMACPP_URL env vars in .env over hard-coding here.
-  # ollama_url: http://localhost:11434
-  # llamacpp_url: http://localhost:8080
+  # Docker containers reach the host-side Ollama service through this address.
+  ollama_url: http://host.docker.internal:11434
+  # llamacpp_url: http://host.docker.internal:8080
 
 # Agent identity
 # ==============================================================================

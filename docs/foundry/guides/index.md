@@ -15,3 +15,4 @@ Practical guides for extending a Strands Base Agent fork.
 - **[Embedding `process_query`](./embedding-process-query.md)** — use the agent from CLI, Lambda, or other interfaces
 - **[Built-in HTTP API](./http-api.md)** — reference for the query, streaming, and chat history endpoints
 - **[Built-in A2A Protocol](./a2a-protocol.md)** — reference for the agent card, JSON-RPC, and streaming routes
+- **[A2A Agent Lifecycle Discrepancy](./a2a-agent-factory-migration.md)** — documents the deprecated shared-agent baseline and recommended `agent_factory` migration

@@ -6,7 +6,89 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from strands_base_agent.server import ReconnectingAgentProxy
+from strands_base_agent.server import ContextAgentProxy, ReconnectingAgentProxy
+
+
+def _agen(items):
+    async def _gen():
+        for item in items:
+            yield item
+
+    return _gen()
+
+
+class TestContextAgentProxy:
+    @pytest.mark.asyncio
+    async def test_lazily_creates_persistent_context_agent(self):
+        mock_agent = MagicMock()
+        mock_agent.stream_async = MagicMock(return_value=_agen([{"type": "final"}]))
+        mock_factory = MagicMock()
+        mock_factory.create_agent = AsyncMock(return_value=mock_agent)
+
+        proxy = ContextAgentProxy(
+            "context-123",
+            mock_factory,
+            name="test-agent",
+            description="test description",
+            persist_session=True,
+        )
+
+        # Construction is synchronous and must not perform model, tool, or MCP I/O.
+        mock_factory.create_agent.assert_not_awaited()
+
+        events = [event async for event in proxy.stream_async("hello")]
+
+        assert events == [{"type": "final"}]
+        mock_factory.create_agent.assert_awaited_once_with(config_overrides={"session_id": "context-123"})
+        assert mock_agent.name == "test-agent"
+        assert mock_agent.description == "test description"
+
+    @pytest.mark.asyncio
+    async def test_nonpersistent_context_does_not_enable_file_sessions(self):
+        mock_agent = MagicMock()
+        mock_agent.invoke_async = AsyncMock(return_value="response")
+        mock_factory = MagicMock()
+        mock_factory.create_agent = AsyncMock(return_value=mock_agent)
+
+        proxy = ContextAgentProxy(
+            "context-456",
+            mock_factory,
+            name="test-agent",
+            description="test description",
+            persist_session=False,
+        )
+
+        assert await proxy.invoke_async("hello") == "response"
+        mock_factory.create_agent.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_distinct_contexts_create_distinct_agents(self):
+        first_agent = MagicMock()
+        first_agent.invoke_async = AsyncMock(return_value="first")
+        second_agent = MagicMock()
+        second_agent.invoke_async = AsyncMock(return_value="second")
+        mock_factory = MagicMock()
+        mock_factory.create_agent = AsyncMock(side_effect=[first_agent, second_agent])
+
+        first = ContextAgentProxy(
+            "context-a",
+            mock_factory,
+            name="test-agent",
+            description="test description",
+            persist_session=False,
+        )
+        second = ContextAgentProxy(
+            "context-b",
+            mock_factory,
+            name="test-agent",
+            description="test description",
+            persist_session=False,
+        )
+
+        assert await first.invoke_async("one") == "first"
+        assert await second.invoke_async("two") == "second"
+        assert first._proxy is not second._proxy
+        assert mock_factory.create_agent.await_count == 2
 
 
 class TestReconnectingAgentProxyCreate:

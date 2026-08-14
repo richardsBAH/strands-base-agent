@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import threading
+import weakref
 from contextlib import asynccontextmanager
 from typing import Any, Self, cast
 
@@ -35,23 +36,42 @@ class MCPReconnectExhaustedError(RuntimeError):
 class ReconnectingAgentProxy:
     """A proxy for an agent that reconnects to an MCP server if it fails."""
 
-    def __init__(self, agent, agent_factory, max_retries: int = 1):
+    def __init__(
+        self,
+        agent,
+        agent_factory,
+        max_retries: int = 1,
+        config_overrides: dict[str, Any] | None = None,
+    ):
         self._agent_factory = agent_factory
         self._max_retries = max_retries
+        self._config_overrides = config_overrides
         self._lock = threading.RLock()
         self._agent = agent
         self._needs_rebuild = False
 
     @classmethod
-    async def create(cls, agent_factory, max_retries: int = 1) -> Self:
-        agent = await agent_factory.create_agent()
-        return cls(agent, agent_factory, max_retries=max_retries)
+    async def create(
+        cls,
+        agent_factory,
+        max_retries: int = 1,
+        config_overrides: dict[str, Any] | None = None,
+    ) -> Self:
+        create_kwargs = {"config_overrides": config_overrides} if config_overrides else {}
+        agent = await agent_factory.create_agent(**create_kwargs)
+        return cls(
+            agent,
+            agent_factory,
+            max_retries=max_retries,
+            config_overrides=config_overrides,
+        )
 
     async def _recreate_agent_async(self) -> None:
         logger.info("Recreating agent due to MCP error...")
 
         old = None
-        new_agent = await self._agent_factory.create_agent()
+        create_kwargs = {"config_overrides": self._config_overrides} if self._config_overrides else {}
+        new_agent = await self._agent_factory.create_agent(**create_kwargs)
 
         with self._lock:
             old = self._agent
@@ -180,6 +200,96 @@ class ReconnectingAgentProxy:
                 await result
 
 
+class _NoOpToolRegistry:
+    """Empty registry used only while A2AServer builds its public agent card."""
+
+    def get_all_tools_config(self) -> dict[str, Any]:
+        """Return no card skills until an explicit card-skill bootstrap is added."""
+        return {}
+
+
+class ContextAgentProxy:
+    """Lazy, context-scoped bridge from Strands' sync factory to Foundry's async factory.
+
+    ``A2AServer.agent_factory`` must synchronously return an Agent-like object, but
+    Foundry creates configured agents asynchronously because tool and MCP setup may
+    perform I/O. This proxy is cheap to construct synchronously and creates exactly
+    one real agent on the first async invocation for its A2A context.
+    """
+
+    def __init__(
+        self,
+        context_id: str,
+        agent_factory,
+        *,
+        name: str,
+        description: str,
+        persist_session: bool,
+        max_retries: int = 1,
+    ) -> None:
+        self.context_id = context_id
+        self.name = name
+        self.description = description
+        self._agent_factory = agent_factory
+        self._persist_session = persist_session
+        self._max_retries = max_retries
+        self._proxy: ReconnectingAgentProxy | None = None
+        self._initialization_lock = asyncio.Lock()
+        self._card_tool_registry = _NoOpToolRegistry()
+
+    @property
+    def tool_registry(self):
+        """Expose real tools after initialization and a safe card-time registry before it."""
+        if self._proxy is not None:
+            return self._proxy.tool_registry
+        return self._card_tool_registry
+
+    async def _ensure_initialized(self) -> ReconnectingAgentProxy:
+        """Create this context's real agent once, without blocking A2AServer construction."""
+        if self._proxy is not None:
+            return self._proxy
+
+        async with self._initialization_lock:
+            if self._proxy is None:
+                # A2A context IDs become session IDs only when persistence is enabled.
+                # Otherwise each dedicated agent still provides in-memory isolation
+                # without implicitly enabling encrypted file sessions.
+                config_overrides = {"session_id": self.context_id} if self._persist_session else None
+                self._proxy = await ReconnectingAgentProxy.create(
+                    self._agent_factory,
+                    max_retries=self._max_retries,
+                    config_overrides=config_overrides,
+                )
+                self._proxy._agent.name = self.name
+                self._proxy._agent.description = self.description
+        return self._proxy
+
+    def stream_async(self, *args, **kwargs):
+        """Initialize lazily, then stream through this context's reconnecting proxy."""
+
+        async def _stream():
+            proxy = await self._ensure_initialized()
+            async for event in proxy.stream_async(*args, **kwargs):
+                yield event
+
+        return _stream()
+
+    async def invoke_async(self, *args, **kwargs):
+        """Initialize lazily, then invoke this context's agent."""
+        proxy = await self._ensure_initialized()
+        return await proxy.invoke_async(*args, **kwargs)
+
+    def cancel(self) -> None:
+        """Best-effort cancellation for an already initialized context."""
+        if self._proxy is not None:
+            self._proxy.cancel()
+
+    async def aclose(self) -> None:
+        """Close this context's agent and outbound clients if it was initialized."""
+        if self._proxy is not None:
+            await self._proxy.aclose()
+
+
 def start_server() -> None:
     """Start the A2A server.
 
@@ -233,40 +343,32 @@ def start_server() -> None:
     )
 
     set_runtime_container(container)
-    agent_factory = container.resolve(AgentFactory)
+    foundry_agent_factory = container.resolve(AgentFactory)
+    live_context_agents: weakref.WeakSet[ContextAgentProxy] = weakref.WeakSet()
 
-    # Agent instance created async in lifespan; placeholder for closure reference
-    agent_instance: ReconnectingAgentProxy | None = None
+    def create_context_agent(context_id: str):
+        """Return a dedicated lazy agent for one A2A conversation context.
 
-    # Create A2A server — agent_instance is set before requests arrive via lifespan.
-    # A2AServer.__init__ eagerly accesses .name, .description on the agent (for the
-    # agent card) and passes it to StrandsA2AExecutor which checks ._session_manager
-    # and calls .take_snapshot(). We satisfy those during construction with safe
-    # defaults; all runtime access defers to the real agent once lifespan initializes it.
-    class _NoOpToolRegistry:
-        """Stub registry for agent card construction before real agent exists."""
-
-        def get_all_tools_config(self):
-            return {}
-
-    class _LazyAgentProxy:
-        """Provides card metadata for A2AServer construction; defers runtime access."""
-
-        name = config.agent_name
-        description = config.agent_description
-        _session_manager = None
-        tool_registry = _NoOpToolRegistry()
-
-        def take_snapshot(self, **kwargs):
-            return None
-
-        def __getattr__(self, item: str):
-            if agent_instance is None:
-                raise RuntimeError("Agent not yet initialized")
-            return getattr(agent_instance, item)
+        Strands invokes this synchronously once for agent-card metadata and once
+        for each new runtime context. The proxy defers Foundry's asynchronous
+        model/tool initialization until the context receives its first request.
+        """
+        context_agent = ContextAgentProxy(
+            context_id,
+            foundry_agent_factory,
+            name=config.agent_name,
+            description=config.agent_description,
+            persist_session=getattr(config, "session_type", None) is not None,
+            max_retries=1,
+        )
+        live_context_agents.add(context_agent)
+        return cast(Any, context_agent)
 
     a2a_server = A2AServer(
-        agent=cast(Any, _LazyAgentProxy()),
+        # Factory mode is the Strands-recommended lifecycle: each context owns
+        # an independent agent and can execute concurrently without snapshot
+        # swapping or cross-context conversation state.
+        agent_factory=create_context_agent,
         host=host,
         port=port,
         http_url=agent_public_url,
@@ -297,19 +399,21 @@ def start_server() -> None:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        nonlocal agent_instance
         async with original_lifespan(app):
             try:
-                agent_instance = await ReconnectingAgentProxy.create(agent_factory, max_retries=1)
-                agent_instance._agent.name = config.agent_name
-                agent_instance._agent.description = config.agent_description
                 yield
             finally:
-                try:
-                    if agent_instance is not None:
-                        await agent_instance.aclose()
-                except Exception as e:
-                    logger.warning("Agent shutdown cleanup warning: %s", e)
+                # Weak references preserve Strands' max_contexts/LRU ownership;
+                # close every still-live initialized context during shutdown.
+                for context_agent in list(live_context_agents):
+                    try:
+                        await context_agent.aclose()
+                    except Exception as e:
+                        logger.warning(
+                            "Agent shutdown cleanup warning for context %s: %s",
+                            context_agent.context_id,
+                            e,
+                        )
 
     fastapi_app.router.lifespan_context = lifespan
 
@@ -332,8 +436,9 @@ def start_server() -> None:
 
     @fastapi_app.exception_handler(ServerError)
     async def handle_a2a_server_error(_: Request, exc: ServerError):  # pyright: ignore[reportUnusedFunction]
-        if _is_mcp_chain(exc) and agent_instance is not None:
-            agent_instance.mark_stale()
+        if _is_mcp_chain(exc):
+            # Reconnect state is owned by the failing context's proxy. The HTTP
+            # contract remains retryable without marking every context stale.
             return JSONResponse(
                 status_code=400,
                 content={

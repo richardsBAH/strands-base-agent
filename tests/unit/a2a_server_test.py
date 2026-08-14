@@ -152,8 +152,10 @@ class TestA2AServerConsolidated:
         assert kwargs["http_url"] == expected_http_url
         assert kwargs["version"] == expected_values["version"]
 
-        # Agent is now created lazily in lifespan — verify proxy is passed
-        assert kwargs["agent"] is not None
+        # A2A uses the Strands-recommended per-context factory, not the
+        # deprecated shared-agent argument.
+        assert callable(kwargs["agent_factory"])
+        assert "agent" not in kwargs
 
         # Verify uvicorn.run was called with the FastAPI app
         mock_uvicorn_run.assert_called_once_with(
@@ -176,13 +178,12 @@ class TestA2AServerConsolidated:
                         with pytest.raises(ValueError):
                             start_server()
 
-    def test_a2a_server_error_handling_agent_creation_failure(self) -> None:
-        """Test that lazy proxy raises if accessed before lifespan initializes agent."""
+    def test_a2a_server_defers_context_agent_creation(self) -> None:
+        """Test that context agents are deferred until the first A2A request."""
         from strands_base_agent.server import start_server
 
-        # Agent creation now happens in the async lifespan, not during start_server().
-        # The _LazyAgentProxy raises RuntimeError if accessed before initialization.
-        # This test verifies start_server() itself doesn't crash (agent is deferred).
+        # The synchronous A2A factory returns a ContextAgentProxy. Foundry's
+        # asynchronous create_agent() is not called during start_server().
         with patch("strands_base_agent.server.AgentConfig.from_env") as mock_config:
             mock_config_instance = Mock()
             mock_config_instance.agent_version = "1.0.0"
@@ -204,7 +205,7 @@ class TestA2AServerConsolidated:
                         with patch.dict(
                             os.environ, {"HOST": "127.0.0.1", "PORT": "8000", "STRANDS_TLS_MODE": "platform"}
                         ):
-                            start_server()  # Should not raise — agent is deferred
+                            start_server()  # Should not raise — real agent creation is deferred
 
     def test_a2a_server_error_handling_server_creation_failure(self) -> None:
         """Test server startup handles A2A server creation failure gracefully."""
