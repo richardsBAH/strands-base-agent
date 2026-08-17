@@ -16,3 +16,4 @@ Practical guides for extending a Strands Base Agent fork.
 - **[Built-in HTTP API](./http-api.md)** — reference for the query, streaming, and chat history endpoints
 - **[Built-in A2A Protocol](./a2a-protocol.md)** — reference for the agent card, JSON-RPC, and streaming routes
 - **[A2A Agent Lifecycle Discrepancy](./a2a-agent-factory-migration.md)** — documents the deprecated shared-agent baseline and recommended `agent_factory` migration
+- **[A2A Agent Factory Validation](./a2a-agent-factory-validation.md)** — live same-context, cross-context, and concurrent-isolation test with recorded results
