@@ -94,10 +94,10 @@ If you introduce a new service (say, `ReportRenderer`) that route handlers need:
    from typing import Annotated
    from fastapi import Depends
 
+
    async def render_report(
        renderer: Annotated[ReportRenderer, Depends(get_report_renderer)],
-   ):
-       ...
+   ): ...
    ```
 
 ## What Not to Touch

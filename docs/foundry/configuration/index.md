@@ -150,12 +150,14 @@ from pydantic import BaseModel
 from foundry_agent_config import load_config
 from foundry_strands_agent import StrandsAgentConfig
 
+
 class FinanceAgentConfig(BaseModel):
     model_config = {"frozen": True}
     agent: StrandsAgentConfig
     db_url: str = ""
     api_key_env: str = ""
     report_format: str = "pdf"
+
 
 # application/factory.py
 config = load_config(FinanceAgentConfig, Path("config.yaml"), "FINANCE")

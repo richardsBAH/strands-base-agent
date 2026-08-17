@@ -40,6 +40,7 @@ Tools give your agent domain-specific capabilities. Strands supports two ways to
            Returns True for heads and False for tails.
        """
        import random
+
        return random.random() >= 0.5
 
 
